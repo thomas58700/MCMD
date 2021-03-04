@@ -1,0 +1,270 @@
+/*
+ * Copyright 2018-2020 Thingstream AG
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "thingstream.h"
+
+/* SoftwareSerial, if used, requires the RX, TX pins to be specified.
+ * Make sure to check SoftwareSerial restrictions on which pins can
+ * be used. Some implementations require change interrupt capability
+ * on the RX pin.
+ */
+
+#define MODEM_SERIAL_PARAMS 19200
+
+/* Specify the modem UDP initialisation routine to use in
+ * Thingstream_createModem2Transport().
+ */
+
+ 
+#define THINGSTREAM_MODEM_INIT Thingstream_Simcom868Init
+
+#if defined(ARDUINO_AVR_LEONARDO)
+    #error Leonardo: not enough memory for UDP
+    // modem on D0(RX) and D1(TX)
+    #define MODEM_SERIAL Serial1
+#elif defined(ARDUINO_AVR_MEGA2560)
+    // modem on RX1/TX1 pins
+    #define MODEM_SERIAL Serial1
+#elif defined(ARDUINO_ARCH_ESP8266)
+    #include <SoftwareSerial.h>
+    // modem on GPIO14(RX) and GPIO12(TX)
+    SoftwareSerial swSerial(14, 12);
+    #define MODEM_SERIAL swSerial
+#elif defined(ARDUINO_ARCH_ESP32)
+    #undef THINGSTREAM_MODEM_INIT
+    #define THINGSTREAM_MODEM_INIT Thingstream_Simcom800Init
+    HardwareSerial hwSerial(1);
+    #define MODEM_SERIAL hwSerial
+    #undef MODEM_SERIAL_PARAMS
+    // Configure hardware UART 1 using pins GPIO26(RX) and GPIO27(TX)
+    #define MODEM_SERIAL_PARAMS 115200,SERIAL_8N1,26,27
+    #define MODEM_POWER 23
+    #define DEBUG_SERIAL Serial
+#elif defined(ARDUINO_SAMD_MKRGSM1400)
+    #undef THINGSTREAM_MODEM_INIT
+    #define THINGSTREAM_MODEM_INIT Thingstream_uBloxSaraU2Init
+    #define MODEM_SERIAL Serial2
+    
+#elif defined(ARDUINO_SAMD_MKRNB1500)
+    #define MODEM_SERIAL SerialSARA
+    #undef THINGSTREAM_MODEM_INIT
+    #define THINGSTREAM_MODEM_INIT Thingstream_uBloxSaraR4Init
+    #undef MODEM_SERIAL_PARAMS
+    #define MODEM_SERIAL_PARAMS 115200
+
+    
+#elif defined(ARDUINO_ARCH_SAMD)
+    // modem on D0(RX) and D1(TX)
+    #define MODEM_SERIAL Serial1
+    #define DEBUG_SERIAL SerialUSB
+#elif defined(TEENSYDUINO) && defined(__arm__)
+    #define MODEM_SERIAL Serial1
+    #define DEBUG_SERIAL SerialUSB
+    #undef MODEM_SERIAL_PARAMS
+    #define MODEM_SERIAL_PARAMS 115200
+#elif defined(ARDUINO_ARCH_STM32)
+    HardwareSerial Serial1(USART1);
+    #define MODEM_SERIAL Serial1
+#else
+    #error "Please define the MODEM_SERIAL appropriate for your board."
+#endif
+
+/*
+ * If DEBUG_SERIAL is not explicitly defined above, assume that debug logs
+ * should go to SERIAL_PORT_MONITOR, as defined in the board's variant.h
+ */
+#ifndef DEBUG_SERIAL
+#define DEBUG_SERIAL SERIAL_PORT_MONITOR
+#endif
+
+/*
+ * Thingstream Modem and Client logging
+ *
+ * Set the following defines to '1' to enable Thingstream modem
+ * and/or client transport logging.
+ *
+ * If the modem logging appears to truncate long messages, that
+ * might indicate a timing issue with the logging. See the example
+ * documentation for details.
+ */
+#define DEBUG_LOG_MODEM 0 // set to 1 to enable Thingstream modem
+#define DEBUG_LOG_CLIENT 0
+
+static bool do_check(int line, const char* msg, bool cond, bool fatal);
+#define ASSERT(msg, cond) do { do_check(__LINE__, msg, (cond), true); } while(0)
+#define CHECK(msg, cond) do { if (!do_check(__LINE__, msg, (cond), false)) return; } while(0)
+
+/* buffer for modem2 parser */
+#ifndef MODEM2_BUFFER_LENGTH
+#define MODEM2_BUFFER_LENGTH MODEM2_UDP_BUFFER_LEN
+#endif
+static uint8_t modem2_buffer[MODEM2_BUFFER_LENGTH];
+
+/* topic name used for publishing and receiving messages in this example */
+#define EXAMPLE_TOPIC "test/arduino/first"
+
+static ThingstreamClient* client;
+static ThingstreamTransport* thingstreamTransport;
+static ThingstreamTopic topic;
+static bool registered = false;
+
+static bool do_check(int line, const char* msg, bool cond, bool fatal) {
+    DEBUG_SERIAL.print(msg);
+    DEBUG_SERIAL.print((cond) ? " ok" : " error");
+    DEBUG_SERIAL.print(" @");
+    DEBUG_SERIAL.println(line);
+    if (!(cond)) {
+      if (fatal) {
+        DEBUG_SERIAL.println("Fatal error; halting");
+        while(true);
+      } else {
+        DEBUG_SERIAL.println("Waiting for 120s before retrying");
+        delay(120000UL);
+      }
+    }
+    return cond;
+}
+
+/* Support routine used by Thingstream_Util_printf */
+void Thingstream_Platform_puts(const char* str, int len)
+{
+    if (len > 0) {
+        DEBUG_SERIAL.write((const uint8_t*)str, len);
+    }
+}
+
+/* Callback for receiving messages. This will only ever be called from
+ * within ThingstreamClient.run()
+ */
+void Thingstream_Application_subscribeCallback(ThingstreamTopic topic, ThingstreamQualityOfService_t qos, uint8_t* msg, uint16_t msgLen) {
+    UNUSED(topic);  /* we only subscribe to one topic; no need to check the ID */
+    UNUSED(qos);    /* will always be MQTT_QOS1, as used in subscribe and publish */
+
+    if (msgLen > 0) {
+        DEBUG_SERIAL.print("Received message: ");
+        DEBUG_SERIAL.write(msg, msgLen);
+        DEBUG_SERIAL.println();
+    } else {
+        DEBUG_SERIAL.println("Received empty message");
+    }
+}
+
+static void enableModem() {
+/* Some built-in modems must be explicitly enabled  */
+#ifdef MODEM_POWER
+    pinMode(MODEM_POWER, OUTPUT);
+    digitalWrite(MODEM_POWER, HIGH);
+    delay(3000);
+#endif
+#ifdef ARDUINO_SAMD_MKRGSM1400
+    pinMode(GSM_RESETN, OUTPUT);
+    digitalWrite(GSM_RESETN, HIGH);
+    delay(100);
+    digitalWrite(GSM_RESETN, LOW);
+#elif defined (ARDUINO_SAMD_MKRNB1500)
+    pinMode(SARA_PWR_ON, OUTPUT);
+    digitalWrite(SARA_PWR_ON, HIGH);
+    pinMode(SARA_RESETN, OUTPUT);
+    digitalWrite(SARA_RESETN, HIGH);
+    delay(100);
+    digitalWrite(SARA_RESETN, LOW);
+#endif
+}
+
+void setup() {
+    DEBUG_SERIAL.begin(115200);
+    while (!DEBUG_SERIAL) {
+      // wait at most 2s for serial monitor to connect
+      if (millis() > 2000) break;
+    }
+    enableModem();
+    MODEM_SERIAL.begin(MODEM_SERIAL_PARAMS);
+    /* Create serial transport */
+    ThingstreamTransport* transport = serial_transport_create(&MODEM_SERIAL, false, &DEBUG_SERIAL, DEBUG_VERBOSE);
+    ASSERT("serial", transport != NULL);
+
+#if DEBUG_LOG_MODEM
+    transport = Thingstream_createModemLogger(transport,
+                                          Thingstream_Util_printf,
+                                          TLOG_TRACE | TLOG_TIME);
+    ASSERT("log modem", transport != NULL);
+#endif /* DEBUG_LOG_MODEM */
+    ThingstreamTransport* modem = Thingstream_createModem2Transport(transport,
+                                         0, modem2_buffer,
+                                         MODEM2_BUFFER_LENGTH,
+                                         THINGSTREAM_MODEM_INIT, NULL);
+    ASSERT("modem", modem != NULL);
+
+    transport = Thingstream_createBase64CodecTransport(modem);
+    ASSERT("base64", transport != NULL);
+    thingstreamTransport = Thingstream_createProtocolTransport(transport, NULL, 0);
+    ASSERT("thingstream", thingstreamTransport != NULL);
+}
+
+void loop() {
+    ThingstreamClientResult cr;
+    if ((client == NULL) && (thingstreamTransport != NULL)) {
+#if DEBUG_LOG_CLIENT
+        thingstreamTransport = Thingstream_createClientLogger(thingstreamTransport,
+                                              Thingstream_Util_printf,
+                                              TLOG_TRACE | TLOG_TIME);
+        ASSERT("log client", thingstreamTransport != NULL);
+#endif /* DEBUG_LOG_CLIENT */
+        ThingstreamClient* tmp_client;
+        tmp_client = Thingstream_createClient(thingstreamTransport);
+        CHECK("client", tmp_client != NULL);
+        cr = Thingstream_Client_init(tmp_client);
+        CHECK("client init", cr == CLIENT_SUCCESS);
+        client = tmp_client;
+    }
+    if (client != NULL) {
+        if (!registered) {
+            /* Connect to the server with a clean session */
+            cr = Thingstream_Client_connect(client, true, 0, NULL);
+            CHECK("connect", cr == CLIENT_SUCCESS);
+
+            /* register the example topic to obtain a topic ID for publishing */
+            cr = Thingstream_Client_register(client, EXAMPLE_TOPIC, &topic);
+            CHECK("register", cr == CLIENT_SUCCESS);
+
+            /* subscribe to the example topic to receive messages back from the server */
+            cr = Thingstream_Client_subscribeName(client, EXAMPLE_TOPIC, ThingstreamQOS1, NULL);
+            CHECK("subscribe", cr == CLIENT_SUCCESS);
+
+            registered = true;
+        }
+        if (registered) {
+            /* publish a message to the example topic */
+            const char *msg = "Hello from Arduino";
+            cr = Thingstream_Client_publish(client, topic, ThingstreamQOS1, false, (uint8_t*) msg, strlen(msg));
+            if (cr != CLIENT_SUCCESS) {
+                /* if publishing fails, restart from scratch */
+                registered = false;
+            }
+            CHECK("publish", cr == CLIENT_SUCCESS);
+
+            /* wait for a minute, accepting incoming messages, before publishing again */
+            uint32_t now = Thingstream_Platform_getTimeMillis();
+            uint32_t limit = now + 60000;
+            do
+            {
+                Thingstream_Client_run(client, limit - now);
+                now = Thingstream_Platform_getTimeMillis();
+            }
+            while (TIME_COMPARE(now, <, limit));
+        }
+    }
+}
